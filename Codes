@@ -1,0 +1,1930 @@
+"""
+Hydrogel adhesion prediction and constrained data augmentation.
+
+Full execution:
+    python hydrogel_study.py
+
+Main analysis without additional retrospective diagnostics:
+    python hydrogel_study.py --skip-extra
+
+Regenerate figures from an existing completed analysis:
+    python hydrogel_study.py --plots-only
+
+Custom output directory:
+    python hydrogel_study.py --output my_results
+
+Data source:
+    Liao et al., Nature (2025)
+    https://doi.org/10.1038/s41586-025-09269-4
+    https://github.com/sheng-hu/hydrogels
+
+Synthetic responses are inherited parental labels, not new measurements.
+"""
+
+from pathlib import Path
+import argparse
+import hashlib
+import html
+import json
+import platform
+import sys
+import time
+import urllib.request
+
+import joblib
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from scipy.spatial.distance import cdist
+
+from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import (
+    ConstantKernel,
+    Matern,
+    WhiteKernel,
+)
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
+from sklearn.model_selection import (
+    GridSearchCV,
+    GroupKFold,
+    KFold,
+    train_test_split,
+)
+
+from xgboost import XGBRegressor
+from catboost import CatBoostRegressor
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+SEED = 2026
+
+ROOT = Path("hydrogel_outputs").resolve()
+OUT = ROOT / "results" / "review_diagnostics"
+
+COMMIT = "999f3b2b8445243c81d21d6c822ff7d547303360"
+BASE = (
+    "https://raw.githubusercontent.com/"
+    f"sheng-hu/hydrogels/{COMMIT}/"
+)
+
+FEATURES = [
+    "Nucleophilic-HEA",
+    "Hydrophobic-BA",
+    "Acidic-CBEA",
+    "Cationic-ATAC",
+    "Aromatic-PEA",
+    "Amide-AAm",
+]
+
+TARGET = "Glass (kPa)_max"
+
+NAMES = [
+    "Random Forest",
+    "XGBoost",
+    "CatBoost",
+    "Gaussian Process",
+]
+
+MAIN = [
+    "Baseline",
+    "Jitter 0.03 tuned",
+]
+
+SOURCE_HASHES = {
+    180: (
+        "15f5ec9f3380e1d64a3de55cd20a5d4a42"
+        "ded0b1c28af65e50718f7765683673"
+    ),
+    289: (
+        "af59fc2f2c47115f4edee84c54bfd2faa918"
+        "050b4b4f4cdbfdb52a3b90c91a67"
+    ),
+    316: (
+        "b87d8f5f73acb3769fd23b36e7fef5397c"
+        "262f537e89ea9c9b13b91adcda60c6"
+    ),
+    341: (
+        "afbc0a6b3aed2a44a1fbf609b033eeb8cfb"
+        "09c5626fcb8ff08f39cc60ae8ec5b"
+    ),
+}
+
+
+def save_json(path, value):
+    path.write_text(
+        json.dumps(value, indent=2),
+        encoding="utf-8",
+    )
+
+
+def metrics(y, predicted):
+    return {
+        "RMSE": float(np.sqrt(mean_squared_error(y, predicted))),
+        "MAE": float(mean_absolute_error(y, predicted)),
+        "R2": float(r2_score(y, predicted)),
+    }
+
+
+# ============================================================
+# Models and predefined search spaces
+# ============================================================
+
+def specs():
+    """Six candidate configurations per model."""
+    return {
+        "Random Forest": (
+            RandomForestRegressor(
+                n_estimators=250,
+                random_state=SEED,
+                n_jobs=2,
+            ),
+            {
+                "max_depth": [None, 5, 10],
+                "min_samples_leaf": [1, 3],
+            },
+        ),
+        "XGBoost": (
+            XGBRegressor(
+                n_estimators=250,
+                learning_rate=0.04,
+                subsample=1,
+                colsample_bytree=1,
+                objective="reg:squarederror",
+                random_state=SEED,
+                n_jobs=2,
+            ),
+            {
+                "max_depth": [2, 3, 5],
+                "reg_lambda": [1, 10],
+            },
+        ),
+        "CatBoost": (
+            CatBoostRegressor(
+                iterations=300,
+                learning_rate=0.04,
+                loss_function="RMSE",
+                verbose=False,
+                random_seed=SEED,
+                thread_count=2,
+                allow_writing_files=False,
+            ),
+            {
+                "depth": [3, 5, 7],
+                "l2_leaf_reg": [3, 10],
+            },
+        ),
+        "Gaussian Process": (
+            GaussianProcessRegressor(
+                normalize_y=True,
+                optimizer=None,
+                random_state=SEED,
+            ),
+            {
+                "kernel": [
+                    ConstantKernel(1.0)
+                    * Matern(length_scale=length, nu=2.5)
+                    + WhiteKernel(noise_level=noise)
+                    for length in [0.1, 0.3, 1.0]
+                    for noise in [0.01, 0.1]
+                ]
+            },
+        ),
+    }
+
+
+# ============================================================
+# Download and verify frozen public data
+# ============================================================
+
+def prepare_data():
+    tables = {}
+    manifest = []
+
+    for n in [180, 289, 316, 341]:
+        relative = f"data/df_{n}.csv"
+        path = ROOT / relative
+        url = BASE + relative
+
+        if not path.exists():
+            print(f"Downloading {relative}", flush=True)
+            with urllib.request.urlopen(url, timeout=90) as response:
+                path.write_bytes(response.read())
+
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != SOURCE_HASHES[n]:
+            raise RuntimeError(f"Source hash mismatch: {relative}")
+
+        tables[n] = pd.read_csv(path, index_col=0)
+        manifest.append({
+            "file": relative,
+            "url": url,
+            "sha256": digest,
+        })
+
+    save_json(ROOT / "data/source_manifest.json", manifest)
+
+    def keys(frame):
+        return list(
+            map(tuple, frame[FEATURES].round(8).to_numpy())
+        )
+
+    sets = {
+        n: set(keys(frame))
+        for n, frame in tables.items()
+    }
+
+    assert sets[180] < sets[289] < sets[316] < sets[341]
+
+    source = tables[341]
+
+    rounds = [
+        next(
+            j
+            for j, n in enumerate([180, 289, 316, 341])
+            if composition in sets[n]
+        )
+        for composition in keys(source)
+    ]
+
+    order = np.argsort(rounds, kind="stable")
+    clean = source.iloc[order].copy()
+
+    response_mapping = dict(zip(keys(clean), clean[TARGET]))
+
+    for frame in tables.values():
+        assert np.allclose(
+            [response_mapping[k] for k in keys(frame)],
+            frame[TARGET],
+        )
+
+    clean.insert(
+        0,
+        "formulation_id",
+        [f"F{i + 1:03d}" for i in clean.index],
+    )
+    clean.insert(1, "source_row_index", clean.index)
+
+    # Snapshot membership is an acquisition proxy, not a verified lab batch.
+    clean["batch"] = np.select(
+        [
+            np.arange(341) < 180,
+            np.arange(341) < 289,
+            np.arange(341) < 316,
+        ],
+        ["Initial", "Round 1", "Round 2"],
+        default="Round 3",
+    )
+
+    X = clean[FEATURES].to_numpy(float)
+    y = clean[TARGET].to_numpy(float)
+
+    assert len(clean) == 341
+    assert np.isfinite(X).all()
+    assert np.isfinite(y).all()
+    assert (X >= 0).all()
+    assert np.allclose(X.sum(axis=1), 1)
+    assert not clean[FEATURES].round(8).duplicated().any()
+
+    clean.to_csv(
+        ROOT / "data/clean_formulations.csv",
+        index=False,
+    )
+
+    print(
+        "Verified four snapshots and reconstructed "
+        "341 unique real formulations.",
+        flush=True,
+    )
+
+
+# ============================================================
+# Constrained compositional augmentation
+# ============================================================
+
+def perturb(X, sigma=0.03, seed=2026, cap=0.01):
+    """
+    Generate one child per parent.
+
+    1. Gaussian log perturbation.
+    2. Closure to unit sum.
+    3. Radial contraction if a component changes by more than cap.
+
+    Existing zeros remain zero.
+    sigma is a modeling choice, not measured instrument error.
+    cap=0.01 means one molar percentage point.
+    """
+    X = np.asarray(X, dtype=float)
+
+    epsilon = np.random.default_rng(seed).normal(
+        0,
+        sigma,
+        X.shape,
+    )
+
+    raw = X * np.exp(epsilon)
+    raw /= raw.sum(axis=1, keepdims=True)
+
+    delta = raw - X
+    peak = np.abs(delta).max(axis=1, keepdims=True)
+
+    shrink = np.minimum(
+        1,
+        cap / np.maximum(peak, 1e-15),
+    )
+
+    child = X + delta * shrink
+
+    assert np.allclose(child.sum(axis=1), 1, atol=1e-12)
+    assert (child >= 0).all()
+    assert np.array_equal(child == 0, X == 0)
+    assert np.abs(child - X).max() <= cap + 1e-12
+
+    return child
+
+
+class AugmentedRegressor(RegressorMixin, BaseEstimator):
+    """
+    Augmentation occurs inside fit().
+
+    GridSearchCV therefore generates children only from the real
+    fitting rows in each inner fold.
+    """
+
+    def __init__(self, estimator, sigma=0.03, seed=2026):
+        self.estimator = estimator
+        self.sigma = sigma
+        self.seed = seed
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+
+        child = perturb(
+            X,
+            sigma=self.sigma,
+            seed=self.seed,
+        )
+
+        self.estimator_ = clone(self.estimator).fit(
+            np.vstack([X, child]),
+            np.r_[y, y],
+        )
+
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def predict(self, X):
+        return self.estimator_.predict(X)
+
+
+# ============================================================
+# Inner and final hyperparameter tuning
+# ============================================================
+
+def tune(name, X, y, seed, sigma=None):
+    estimator, grid = specs()[name]
+
+    if sigma is not None:
+        estimator = AugmentedRegressor(
+            estimator,
+            sigma=sigma,
+            seed=seed,
+        )
+        grid = {
+            "estimator__" + key: values
+            for key, values in grid.items()
+        }
+
+    cv = KFold(
+        n_splits=3,
+        shuffle=True,
+        random_state=seed,
+    )
+
+    search = GridSearchCV(
+        estimator,
+        grid,
+        cv=cv,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=1,
+        refit=True,
+        error_score="raise",
+    )
+
+    search.fit(X, y)
+
+    parameters = {
+        key: str(value)
+        for key, value in search.best_params_.items()
+    }
+
+    return search.best_estimator_, parameters
+
+
+def final_tune(name, X, y, sigma):
+    estimator, grid = specs()[name]
+
+    if sigma is not None:
+        estimator = AugmentedRegressor(
+            estimator,
+            sigma=sigma,
+            seed=SEED,
+        )
+        grid = {
+            "estimator__" + key: values
+            for key, values in grid.items()
+        }
+
+    search = GridSearchCV(
+        estimator,
+        grid,
+        cv=KFold(
+            n_splits=5,
+            shuffle=True,
+            random_state=SEED,
+        ),
+        scoring="neg_root_mean_squared_error",
+        n_jobs=1,
+        refit=True,
+        error_score="raise",
+    )
+
+    search.fit(X, y)
+
+    parameters = {
+        key: str(value)
+        for key, value in search.best_params_.items()
+    }
+
+    return search.best_estimator_, parameters
+
+
+# ============================================================
+# Original analysis: 80/20 split and nested five-fold CV
+# ============================================================
+
+def run_study():
+    start = time.time()
+
+    df = pd.read_csv(ROOT / "data/clean_formulations.csv")
+
+    train_idx, test_idx = train_test_split(
+        np.arange(len(df)),
+        test_size=0.2,
+        random_state=SEED,
+        shuffle=True,
+    )
+
+    # Preserve the original ordering for subsequent fold assignments.
+    train_idx = np.sort(train_idx)
+    test_idx = np.sort(test_idx)
+
+    assert len(train_idx) == 272
+    assert len(test_idx) == 69
+    assert set(train_idx).isdisjoint(test_idx)
+
+    Xall = df[FEATURES].to_numpy(float)
+    yall = df[TARGET].to_numpy(float)
+
+    train = df.iloc[train_idx].reset_index(drop=True)
+    hold = df.iloc[test_idx].reset_index(drop=True)
+
+    train.to_csv(ROOT / "data/train_real_272.csv", index=False)
+    hold.to_csv(ROOT / "data/test_real_69.csv", index=False)
+
+    X = Xall[train_idx]
+    y = yall[train_idx]
+
+    split = df[["formulation_id", "batch"]].copy()
+    split["split"] = "train"
+    split.loc[test_idx, "split"] = "test"
+    split.to_csv(ROOT / "data/split_manifest.csv", index=False)
+
+    rows = []
+    predictions = []
+    parameters = []
+    fold_assignments = []
+    children = []
+
+    outer = KFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=SEED,
+    )
+
+    for fold, (tr, va) in enumerate(outer.split(X), start=1):
+        fold_seed = SEED + fold
+
+        assert set(tr).isdisjoint(va)
+        assert set(train_idx[np.r_[tr, va]]).isdisjoint(test_idx)
+
+        fold_assignments.extend(
+            {
+                "formulation_id": train.iloc[i].formulation_id,
+                "validation_fold": fold,
+            }
+            for i in va
+        )
+
+        child = perturb(X[tr], sigma=0.03, seed=fold_seed)
+
+        for i, composition in zip(tr, child):
+            children.append({
+                "fold": fold,
+                "parent_id": train.iloc[i].formulation_id,
+                "origin": "synthetic_training_only",
+                "inherited_target": float(y[i]),
+                **dict(zip(FEATURES, composition)),
+                "max_component_change": float(
+                    np.abs(composition - X[i]).max()
+                ),
+            })
+
+        for name in NAMES:
+            baseline, baseline_parameters = tune(
+                name, X[tr], y[tr], fold_seed
+            )
+            augmented, augmented_parameters = tune(
+                name, X[tr], y[tr], fold_seed, sigma=0.03
+            )
+
+            fitted = {
+                MAIN[0]: baseline,
+                MAIN[1]: augmented,
+
+                # Same baseline parameters, plus perturbation.
+                "Jitter 0.03 fixed baseline": AugmentedRegressor(
+                    clone(baseline),
+                    sigma=0.03,
+                    seed=fold_seed,
+                ).fit(X[tr], y[tr]),
+
+                # Duplicate parents without perturbing their compositions.
+                "Duplicate control": AugmentedRegressor(
+                    clone(baseline),
+                    sigma=0,
+                    seed=fold_seed,
+                ).fit(X[tr], y[tr]),
+
+                # Retain parameters selected at sigma=0.03.
+                "Jitter 0.01 sensitivity": AugmentedRegressor(
+                    clone(augmented.estimator),
+                    sigma=0.01,
+                    seed=fold_seed,
+                ).fit(X[tr], y[tr]),
+
+                "Jitter 0.05 sensitivity": AugmentedRegressor(
+                    clone(augmented.estimator),
+                    sigma=0.05,
+                    seed=fold_seed,
+                ).fit(X[tr], y[tr]),
+            }
+
+            parameters.append({
+                "fold": fold,
+                "model": name,
+                "baseline": baseline_parameters,
+                "augmented": augmented_parameters,
+            })
+
+            for scenario, model in fitted.items():
+                p = model.predict(X[va])
+
+                rows.append({
+                    "fold": fold,
+                    "model": name,
+                    "scenario": scenario,
+                    "n_train_real": len(tr),
+                    "n_train_synthetic": (
+                        0 if scenario == MAIN[0] else len(tr)
+                    ),
+                    "n_validation_real": len(va),
+                    **metrics(y[va], p),
+                })
+
+                predictions.extend(
+                    {
+                        "fold": fold,
+                        "model": name,
+                        "scenario": scenario,
+                        "formulation_id": train.iloc[i].formulation_id,
+                        "actual": float(actual),
+                        "predicted": float(predicted),
+                    }
+                    for i, actual, predicted in zip(va, y[va], p)
+                )
+
+            print(
+                f"Fold {fold}/5 | {name} | "
+                f"RMSE original={rows[-6]['RMSE']:.3f}, "
+                f"augmented={rows[-5]['RMSE']:.3f}",
+                flush=True,
+            )
+
+        # Save intermediate results after every completed outer fold.
+        pd.DataFrame(rows).to_csv(
+            ROOT / "results/cv_fold_metrics.csv",
+            index=False,
+        )
+        pd.DataFrame(predictions).to_csv(
+            ROOT / "results/cv_oof_predictions.csv",
+            index=False,
+        )
+
+    pd.DataFrame(fold_assignments).to_csv(
+        ROOT / "data/train_cv_assignments.csv",
+        index=False,
+    )
+    pd.DataFrame(children).to_csv(
+        ROOT / "data/cv_synthetic_audit.csv",
+        index=False,
+    )
+    save_json(
+        ROOT / "results/cv_hyperparameters.json",
+        parameters,
+    )
+
+    folds = pd.DataFrame(rows)
+    oof = pd.DataFrame(predictions)
+
+    summary_rows = []
+
+    for (name, scenario), d in oof.groupby(
+        ["model", "scenario"],
+        sort=False,
+    ):
+        assert len(d) == 272
+        assert d.formulation_id.nunique() == 272
+        assert set(d.formulation_id).isdisjoint(hold.formulation_id)
+
+        f = folds[
+            (folds.model == name)
+            & (folds.scenario == scenario)
+        ]
+
+        summary_rows.append({
+            "model": name,
+            "scenario": scenario,
+            **metrics(d.actual, d.predicted),
+            **{
+                metric + "_fold_mean": float(f[metric].mean())
+                for metric in ["RMSE", "MAE", "R2"]
+            },
+            **{
+                metric + "_fold_sd": float(f[metric].std(ddof=1))
+                for metric in ["RMSE", "MAE", "R2"]
+            },
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(ROOT / "results/cv_summary.csv", index=False)
+
+    # Select before evaluating the holdout.
+    ranking = (
+        summary[summary.scenario.isin(MAIN)]
+        .sort_values("RMSE_fold_mean")
+    )
+
+    selected = ranking.iloc[0][
+        ["model", "scenario", "RMSE_fold_mean"]
+    ].to_dict()
+
+    save_json(
+        ROOT / "results/selection_before_test.json",
+        selected,
+    )
+
+    print("Selected using training CV only:", selected, flush=True)
+
+    fitted_final = {}
+    final_parameters = []
+
+    for name in NAMES:
+        for scenario, sigma in zip(MAIN, [None, 0.03]):
+            model, settings = final_tune(name, X, y, sigma)
+
+            fitted_final[(name, scenario)] = model
+            final_parameters.append({
+                "model": name,
+                "scenario": scenario,
+                "parameters": settings,
+            })
+
+            suffix = "baseline" if sigma is None else "augmented"
+            filename = f"{name.replace(' ', '_')}_{suffix}.joblib"
+            joblib.dump(model, ROOT / "models" / filename)
+
+        print("Final tuning completed:", name, flush=True)
+
+    save_json(
+        ROOT / "results/final_hyperparameters.json",
+        final_parameters,
+    )
+
+    # All fitting, tuning and selection have finished.
+    test_rows = []
+    test_predictions = []
+
+    for (name, scenario), model in fitted_final.items():
+        p = model.predict(Xall[test_idx])
+
+        test_rows.append({
+            "model": name,
+            "scenario": scenario,
+            "n_train_real": 272,
+            "n_train_synthetic": (
+                0 if scenario == MAIN[0] else 272
+            ),
+            "n_test_real": 69,
+            **metrics(yall[test_idx], p),
+        })
+
+        test_predictions.extend(
+            {
+                "model": name,
+                "scenario": scenario,
+                "formulation_id": df.iloc[i].formulation_id,
+                "actual": float(actual),
+                "predicted": float(predicted),
+            }
+            for i, actual, predicted in zip(
+                test_idx, yall[test_idx], p
+            )
+        )
+
+    tests = pd.DataFrame(test_rows)
+    tests.to_csv(ROOT / "results/test_metrics.csv", index=False)
+
+    pd.DataFrame(test_predictions).to_csv(
+        ROOT / "results/test_predictions.csv",
+        index=False,
+    )
+
+    final_child = perturb(X, sigma=0.03, seed=SEED)
+
+    expanded = pd.DataFrame(
+        np.vstack([X, final_child]),
+        columns=FEATURES,
+    )
+    expanded["inherited_or_measured_target"] = np.r_[y, y]
+    expanded["parent_id"] = list(train.formulation_id) * 2
+    expanded["origin"] = ["real"] * 272 + ["synthetic"] * 272
+
+    expanded.to_csv(
+        ROOT / "data/final_augmented_training_544.csv",
+        index=False,
+    )
+
+    comparison = []
+
+    for name in NAMES:
+        s = summary[summary.model == name].set_index("scenario")
+        t = tests[tests.model == name].set_index("scenario")
+
+        f = folds[folds.model == name].pivot(
+            index="fold",
+            columns="scenario",
+            values="RMSE",
+        )
+
+        comparison.append({
+            "model": name,
+            "cv_RMSE_before": s.loc[MAIN[0], "RMSE"],
+            "cv_RMSE_after": s.loc[MAIN[1], "RMSE"],
+            "test_RMSE_before": t.loc[MAIN[0], "RMSE"],
+            "test_RMSE_after": t.loc[MAIN[1], "RMSE"],
+            "test_improvement_pct": 100 * (
+                1
+                - t.loc[MAIN[1], "RMSE"]
+                / t.loc[MAIN[0], "RMSE"]
+            ),
+            "cv_improved_folds": int(
+                (f[MAIN[1]] < f[MAIN[0]]).sum()
+            ),
+        })
+
+    pd.DataFrame(comparison).to_csv(
+        ROOT / "results/comparison.csv",
+        index=False,
+    )
+
+    import sklearn
+    import xgboost
+    import catboost
+
+    protocol = {
+        "seed": SEED,
+        "n_actual": 341,
+        "n_train": 272,
+        "n_test": 69,
+        "outer_cv_folds": 5,
+        "inner_tuning_folds": 3,
+        "final_tuning_folds": 5,
+        "hyperparameter_configurations_per_model": 6,
+        "sigma": 0.03,
+        "sensitivity": [0.01, 0.05],
+        "component_change_cap": 0.01,
+        "children_per_training_parent": 1,
+        "target_noise": False,
+        "feature_selection": False,
+        "features": FEATURES,
+        "target": TARGET,
+        "selection": selected,
+        "holdout_note": (
+            "Retrospective random holdout. Excluded from fitting "
+            "and selection in this run. Dataset explored previously."
+        ),
+        "sensitivity_note": (
+            "Sensitivity retains parameters selected at sigma 0.03; "
+            "not independently tuned."
+        ),
+        "mean_baseline_test": metrics(
+            yall[test_idx],
+            np.full(len(test_idx), y.mean()),
+        ),
+        "noise_max_abs_fraction": float(
+            np.abs(final_child - X).max()
+        ),
+        "noise_median_max_abs_fraction": float(
+            np.median(np.abs(final_child - X).max(axis=1))
+        ),
+        "synthetic_are_new_experiments": False,
+        "elapsed_seconds": time.time() - start,
+        "source_clean_sha256": hashlib.sha256(
+            (ROOT / "data/clean_formulations.csv").read_bytes()
+        ).hexdigest(),
+        "versions": {
+            "python": platform.python_version(),
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "scikit-learn": sklearn.__version__,
+            "xgboost": xgboost.__version__,
+            "catboost": catboost.__version__,
+        },
+    }
+
+    save_json(ROOT / "results/protocol.json", protocol)
+
+    print(tests.to_string(index=False), flush=True)
+    print(
+        "Main analysis elapsed seconds:",
+        round(time.time() - start, 1),
+        flush=True,
+    )
+
+
+# ============================================================
+# Additional retrospective diagnostics
+# ============================================================
+
+def run_additional():
+    OUT.mkdir(parents=True, exist_ok=True)
+    start = time.time()
+
+    train = pd.read_csv(ROOT / "data/train_real_272.csv")
+    test = pd.read_csv(ROOT / "data/test_real_69.csv")
+
+    X = train[FEATURES].to_numpy(float)
+    y = train[TARGET].to_numpy(float)
+
+    assert set(train.formulation_id).isdisjoint(test.formulation_id)
+
+    # Reuse the original repeat rather than changing its recorded results.
+    old = pd.read_csv(ROOT / "results/cv_oof_predictions.csv")
+    old = old[old.scenario.isin(MAIN)].copy()
+    old["repeat_seed"] = 2026
+
+    predictions = old.to_dict("records")
+    parameters = []
+
+    for seed in [2027, 2028, 2029, 2030]:
+        outer = KFold(
+            n_splits=5,
+            shuffle=True,
+            random_state=seed,
+        )
+
+        for fold, (tr, va) in enumerate(outer.split(X), start=1):
+            for name in NAMES:
+                for scenario, sigma in zip(MAIN, [None, 0.03]):
+                    model, settings = tune(
+                        name,
+                        X[tr],
+                        y[tr],
+                        seed + fold,
+                        sigma,
+                    )
+
+                    p = model.predict(X[va])
+
+                    parameters.append({
+                        "repeat_seed": seed,
+                        "fold": fold,
+                        "model": name,
+                        "scenario": scenario,
+                        "parameters": settings,
+                    })
+
+                    predictions.extend(
+                        {
+                            "repeat_seed": seed,
+                            "fold": fold,
+                            "model": name,
+                            "scenario": scenario,
+                            "formulation_id": train.iloc[i].formulation_id,
+                            "actual": float(actual),
+                            "predicted": float(predicted),
+                        }
+                        for i, actual, predicted in zip(va, y[va], p)
+                    )
+
+            print(
+                f"Repeat seed {seed}, fold {fold}/5 finished",
+                flush=True,
+            )
+
+        pd.DataFrame(predictions).to_csv(
+            OUT / "repeated_oof_predictions.csv",
+            index=False,
+        )
+
+    pred = pd.DataFrame(predictions)
+    repeat_rows = []
+
+    for (seed, name, scenario), d in pred.groupby(
+        ["repeat_seed", "model", "scenario"],
+        sort=False,
+    ):
+        assert len(d) == 272
+        assert d.formulation_id.nunique() == 272
+        assert set(d.formulation_id).isdisjoint(test.formulation_id)
+
+        repeat_rows.append({
+            "repeat_seed": seed,
+            "model": name,
+            "scenario": scenario,
+            **metrics(d.actual, d.predicted),
+        })
+
+    repeated = pd.DataFrame(repeat_rows)
+    repeated.to_csv(OUT / "repeated_metrics.csv", index=False)
+
+    repeat_summary = []
+
+    for name in NAMES:
+        d = repeated[repeated.model == name]
+        base = d[d.scenario == MAIN[0]].set_index("repeat_seed")
+        aug = d[d.scenario == MAIN[1]].set_index("repeat_seed")
+
+        row = {
+            "model": name,
+            "improved_repeats": int(
+                (aug.RMSE < base.RMSE).sum()
+            ),
+        }
+
+        for metric in ["RMSE", "MAE"]:
+            comparisons = [
+                ("original", base[metric]),
+                ("augmented", aug[metric]),
+                ("delta", aug[metric] - base[metric]),
+            ]
+
+            for label, values in comparisons:
+                row[f"{metric}_{label}_mean"] = float(values.mean())
+                row[f"{metric}_{label}_sd"] = float(
+                    values.std(ddof=1)
+                )
+
+        repeat_summary.append(row)
+
+    pd.DataFrame(repeat_summary).to_csv(
+        OUT / "repeated_summary.csv",
+        index=False,
+    )
+    save_json(OUT / "repeated_hyperparameters.json", parameters)
+
+    # --------------------------------------------------------
+    # Acquisition-proxy group validation
+    # --------------------------------------------------------
+
+    groups = train.batch.to_numpy()
+    group_predictions = []
+    group_parameters = []
+
+    for k, held in enumerate(pd.unique(groups), start=1):
+        tr = np.flatnonzero(groups != held)
+        va = np.flatnonzero(groups == held)
+
+        assert set(groups[tr]).isdisjoint(groups[va])
+
+        inner = GroupKFold(
+            n_splits=len(np.unique(groups[tr]))
+        )
+
+        for name in NAMES:
+            for scenario, sigma in zip(MAIN, [None, 0.03]):
+                estimator, grid = specs()[name]
+
+                if sigma is not None:
+                    estimator = AugmentedRegressor(
+                        estimator,
+                        sigma=sigma,
+                        seed=3026 + k,
+                    )
+                    grid = {
+                        "estimator__" + key: values
+                        for key, values in grid.items()
+                    }
+
+                search = GridSearchCV(
+                    estimator,
+                    grid,
+                    cv=inner,
+                    scoring="neg_root_mean_squared_error",
+                    n_jobs=1,
+                    refit=True,
+                    error_score="raise",
+                )
+
+                search.fit(
+                    X[tr],
+                    y[tr],
+                    groups=groups[tr],
+                )
+
+                p = search.predict(X[va])
+
+                group_parameters.append({
+                    "held_group": str(held),
+                    "model": name,
+                    "scenario": scenario,
+                    "parameters": {
+                        key: str(value)
+                        for key, value in search.best_params_.items()
+                    },
+                })
+
+                group_predictions.extend(
+                    {
+                        "held_group": str(held),
+                        "model": name,
+                        "scenario": scenario,
+                        "formulation_id": train.iloc[i].formulation_id,
+                        "actual": float(actual),
+                        "predicted": float(predicted),
+                    }
+                    for i, actual, predicted in zip(va, y[va], p)
+                )
+
+        print(
+            "Acquisition proxy held group finished:",
+            held,
+            flush=True,
+        )
+
+    group_pred = pd.DataFrame(group_predictions)
+    group_pred.to_csv(
+        OUT / "group_oof_predictions.csv",
+        index=False,
+    )
+
+    group_metrics = []
+
+    for (name, scenario), d in group_pred.groupby(
+        ["model", "scenario"],
+        sort=False,
+    ):
+        assert len(d) == 272
+        assert d.formulation_id.nunique() == 272
+
+        group_metrics.append({
+            "model": name,
+            "scenario": scenario,
+            **metrics(d.actual, d.predicted),
+        })
+
+    pd.DataFrame(group_metrics).to_csv(
+        OUT / "group_metrics.csv",
+        index=False,
+    )
+    save_json(OUT / "group_hyperparameters.json", group_parameters)
+
+    # --------------------------------------------------------
+    # Composition proximity
+    # --------------------------------------------------------
+
+    distance = 0.5 * cdist(
+        test[FEATURES].to_numpy(float),
+        X,
+        metric="cityblock",
+    )
+
+    nearest = distance.min(axis=1)
+    nearest_index = distance.argmin(axis=1)
+
+    train_distance = 0.5 * cdist(X, X, metric="cityblock")
+    np.fill_diagonal(train_distance, np.inf)
+    leave_one_out = train_distance.min(axis=1)
+
+    pd.DataFrame({
+        "test_id": test.formulation_id,
+        "nearest_train_id": (
+            train.iloc[nearest_index].formulation_id.to_numpy()
+        ),
+        "total_variation_distance": nearest,
+    }).to_csv(
+        OUT / "test_nearest_training.csv",
+        index=False,
+    )
+
+    similarity_audit = {
+        "test_nearest_median": float(np.median(nearest)),
+        "test_nearest_q1": float(np.quantile(nearest, 0.25)),
+        "test_nearest_q3": float(np.quantile(nearest, 0.75)),
+        "train_loo_median": float(np.median(leave_one_out)),
+        "test_nearest_min": float(nearest.min()),
+        "test_nearest_max": float(nearest.max()),
+        "test_within_001": int((nearest <= 0.01).sum()),
+        "test_within_005": int((nearest <= 0.05).sum()),
+        "exact_train_test_duplicates": int(
+            (nearest < 1e-12).sum()
+        ),
+        "counts_by_group": {
+            str(group): {
+                "train": int((train.batch == group).sum()),
+                "test": int((test.batch == group).sum()),
+            }
+            for group in pd.unique(
+                pd.concat([train.batch, test.batch])
+            )
+        },
+    }
+
+    save_json(OUT / "similarity_audit.json", similarity_audit)
+
+    # --------------------------------------------------------
+    # Conditional paired bootstrap of existing test predictions
+    # --------------------------------------------------------
+
+    test_predictions = pd.read_csv(
+        ROOT / "results/test_predictions.csv"
+    )
+
+    rng = np.random.default_rng(4026)
+    bootstrap_indices = rng.integers(
+        0,
+        len(test),
+        size=(10000, len(test)),
+    )
+
+    bootstrap_rows = []
+
+    for name in NAMES:
+        base = (
+            test_predictions[
+                (test_predictions.model == name)
+                & (test_predictions.scenario == MAIN[0])
+            ]
+            .set_index("formulation_id")
+            .loc[test.formulation_id]
+        )
+
+        aug = (
+            test_predictions[
+                (test_predictions.model == name)
+                & (test_predictions.scenario == MAIN[1])
+            ]
+            .set_index("formulation_id")
+            .loc[test.formulation_id]
+        )
+
+        assert np.allclose(base.actual, aug.actual)
+
+        e0 = base.predicted.to_numpy() - base.actual.to_numpy()
+        e1 = aug.predicted.to_numpy() - aug.actual.to_numpy()
+
+        deltas = (
+            np.sqrt(np.mean(e1[bootstrap_indices] ** 2, axis=1))
+            - np.sqrt(np.mean(e0[bootstrap_indices] ** 2, axis=1))
+        )
+
+        lower, upper = np.quantile(deltas, [0.025, 0.975])
+
+        bootstrap_rows.append({
+            "model": name,
+            "delta_RMSE": float(
+                np.sqrt(np.mean(e1 ** 2))
+                - np.sqrt(np.mean(e0 ** 2))
+            ),
+            "conditional_CI_lower": float(lower),
+            "conditional_CI_upper": float(upper),
+        })
+
+    pd.DataFrame(bootstrap_rows).to_csv(
+        OUT / "conditional_bootstrap.csv",
+        index=False,
+    )
+
+    import sklearn
+    import xgboost
+    import catboost
+
+    save_json(
+        OUT / "protocol.json",
+        {
+            "post_review_exploratory": True,
+            "train_real": 272,
+            "original_test_real": 69,
+            "repeats": 5,
+            "outer_folds": 5,
+            "repeat_seeds": [2026, 2027, 2028, 2029, 2030],
+            "model_random_seed": 2026,
+            "repeat_inner_and_noise_seed": "repeat_seed + outer_fold",
+            "group_noise_seeds": [3027, 3028, 3029, 3030],
+            "main_sigma": 0.03,
+            "cap": 0.01,
+            "bootstrap_seed": 4026,
+            "bootstrap_resamples": 10000,
+            "bootstrap_scope": (
+                "Conditional on existing fitted predictions; "
+                "independent rows assumed; no refitting; "
+                "exploratory marginal intervals."
+            ),
+            "original_model_selection_unchanged": True,
+            "elapsed_seconds": time.time() - start,
+            "versions": {
+                "python": platform.python_version(),
+                "numpy": np.__version__,
+                "pandas": pd.__version__,
+                "sklearn": sklearn.__version__,
+                "xgboost": xgboost.__version__,
+                "catboost": catboost.__version__,
+            },
+        },
+    )
+
+    print(pd.DataFrame(repeat_summary).to_string(index=False))
+    print(pd.DataFrame(group_metrics).to_string(index=False))
+    print(pd.DataFrame(bootstrap_rows).to_string(index=False))
+
+
+# ============================================================
+# Figures and HTML report
+# ============================================================
+
+def make_figures():
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 10,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.axisbelow": True,
+        "grid.alpha": 0.2,
+        "pdf.fonttype": 42,
+        "svg.fonttype": "none",
+    })
+
+    colors = ["#2563a6", "#e58139"]
+    short = ["RF", "XGBoost", "CatBoost", "GP"]
+
+    cv = pd.read_csv(ROOT / "results/cv_summary.csv")
+    folds = pd.read_csv(ROOT / "results/cv_fold_metrics.csv")
+    test = pd.read_csv(ROOT / "results/test_metrics.csv")
+    pred = pd.read_csv(ROOT / "results/test_predictions.csv")
+
+    train = pd.read_csv(ROOT / "data/train_real_272.csv")
+    hold = pd.read_csv(ROOT / "data/test_real_69.csv")
+
+    expanded = pd.read_csv(
+        ROOT / "data/final_augmented_training_544.csv"
+    )
+
+    def save(fig, name):
+        for extension in ["png", "pdf", "svg"]:
+            fig.savefig(
+                ROOT / "figures" / f"{name}.{extension}",
+                dpi=250,
+                bbox_inches="tight",
+                facecolor="white",
+            )
+        plt.close(fig)
+
+    # --------------------------------------------------------
+    # 1. Actual versus predicted: all four models, both conditions
+    # --------------------------------------------------------
+
+    fig, axes = plt.subplots(
+        2, 4,
+        figsize=(15, 7),
+        layout="constrained",
+    )
+
+    low = min(pred.actual.min(), pred.predicted.min(), 0)
+    high = max(pred.actual.max(), pred.predicted.max()) * 1.05
+
+    for row, scenario in enumerate(MAIN):
+        for col, name in enumerate(NAMES):
+            ax = axes[row, col]
+
+            d = pred[
+                (pred.model == name)
+                & (pred.scenario == scenario)
+            ]
+            m = test[
+                (test.model == name)
+                & (test.scenario == scenario)
+            ].iloc[0]
+
+            ax.scatter(
+                d.actual,
+                d.predicted,
+                s=26,
+                alpha=0.75,
+                color=colors[row],
+                edgecolor="white",
+                linewidth=0.3,
+            )
+            ax.plot(
+                [low, high],
+                [low, high],
+                "--",
+                color="#555555",
+            )
+
+            condition = "Original" if row == 0 else "Augmented"
+
+            ax.set(
+                xlim=(low, high),
+                ylim=(low, high),
+                xlabel="Actual strength (kPa)",
+                ylabel="Predicted strength (kPa)",
+                title=f"{name} | {condition}",
+            )
+
+            ax.text(
+                0.04,
+                0.94,
+                f"RMSE = {m.RMSE:.2f}\nR² = {m.R2:.3f}",
+                transform=ax.transAxes,
+                va="top",
+            )
+            ax.grid(True)
+
+    save(fig, "01_actual_predicted_test")
+
+    # --------------------------------------------------------
+    # 2. Original versus augmented RMSE
+    # --------------------------------------------------------
+
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(11, 4),
+        layout="constrained",
+    )
+
+    x = np.arange(4)
+
+    for ax, frame, title in zip(
+        axes,
+        [cv, test],
+        [
+            "Nested validation: pooled OOF",
+            "69 real holdout formulations",
+        ],
+    ):
+        for j, scenario in enumerate(MAIN):
+            values = [
+                frame[
+                    (frame.model == name)
+                    & (frame.scenario == scenario)
+                ].iloc[0].RMSE
+                for name in NAMES
+            ]
+
+            ax.bar(
+                x + (j - 0.5) * 0.36,
+                values,
+                0.36,
+                color=colors[j],
+                label=["Original", "Augmented"][j],
+            )
+
+        ax.set(
+            xticks=x,
+            xticklabels=short,
+            ylabel="RMSE (kPa)",
+            title=title,
+        )
+        ax.grid(axis="y")
+        ax.legend(frameon=False)
+
+    save(fig, "02_performance_comparison")
+
+    # --------------------------------------------------------
+    # 3. Paired changes across original CV folds
+    # --------------------------------------------------------
+
+    fig, ax = plt.subplots(
+        figsize=(8, 4),
+        layout="constrained",
+    )
+
+    for i, name in enumerate(NAMES):
+        d = folds[folds.model == name].pivot(
+            index="fold",
+            columns="scenario",
+            values="RMSE",
+        )
+
+        delta = d[MAIN[1]] - d[MAIN[0]]
+
+        ax.scatter(
+            i + np.linspace(-0.12, 0.12, len(delta)),
+            delta,
+            s=40,
+        )
+        ax.plot(
+            [i - 0.22, i + 0.22],
+            [delta.mean()] * 2,
+            color="black",
+            lw=2,
+        )
+
+    ax.axhline(0, color="#555555", ls="--")
+    ax.set(
+        xticks=x,
+        xticklabels=short,
+        ylabel="Augmented − original RMSE (kPa)",
+        title="Paired changes across five original validation folds",
+    )
+    ax.grid(axis="y")
+
+    save(fig, "03_paired_fold_changes")
+
+    # --------------------------------------------------------
+    # 4. Duplication and noise controls
+    # --------------------------------------------------------
+
+    scenarios = [
+        MAIN[0],
+        "Duplicate control",
+        "Jitter 0.03 fixed baseline",
+        "Jitter 0.01 sensitivity",
+        MAIN[1],
+        "Jitter 0.05 sensitivity",
+    ]
+
+    values = np.array([
+        [
+            cv[
+                (cv.model == name)
+                & (cv.scenario == scenario)
+            ].iloc[0].RMSE
+            for scenario in scenarios
+        ]
+        for name in NAMES
+    ])
+
+    change = values - values[:, [0]]
+    scale = max(float(np.abs(change).max()), 0.01)
+
+    fig, ax = plt.subplots(
+        figsize=(11, 4),
+        layout="constrained",
+    )
+
+    image = ax.imshow(
+        change,
+        cmap="RdBu_r",
+        vmin=-scale,
+        vmax=scale,
+        aspect="auto",
+    )
+
+    for i in range(4):
+        for j in range(6):
+            ax.text(
+                j, i,
+                f"{values[i, j]:.2f}",
+                ha="center",
+                va="center",
+            )
+
+    ax.set(
+        yticks=x,
+        yticklabels=short,
+        xticks=np.arange(6),
+        xticklabels=[
+            "Original",
+            "Duplicate",
+            "Noise .03\nfixed settings",
+            "Noise .01",
+            "Noise .03\ntuned",
+            "Noise .05",
+        ],
+        title="Controls: pooled OOF RMSE (kPa)",
+    )
+
+    fig.colorbar(
+        image,
+        ax=ax,
+        label="RMSE change from original (kPa)",
+    )
+
+    save(fig, "04_noise_and_duplication_controls")
+
+    # --------------------------------------------------------
+    # 5. Data and augmentation audit
+    # --------------------------------------------------------
+
+    X = train[FEATURES].to_numpy(float)
+
+    child = (
+        expanded[expanded.origin == "synthetic"][FEATURES]
+        .to_numpy(float)
+    )
+
+    fig, axes = plt.subplots(
+        2, 2,
+        figsize=(11, 8),
+        layout="constrained",
+    )
+
+    axes[0, 0].boxplot(
+        X,
+        tick_labels=["HEA", "BA", "CBEA", "ATAC", "PEA", "AAm"],
+    )
+    axes[0, 0].set(
+        title="Real training compositions",
+        ylabel="Feed mole fraction",
+    )
+
+    axes[0, 1].hist(
+        train[TARGET],
+        bins=18,
+        alpha=0.65,
+        label="Train",
+        color=colors[0],
+    )
+    axes[0, 1].hist(
+        hold[TARGET],
+        bins=18,
+        alpha=0.65,
+        label="Test",
+        color=colors[1],
+    )
+    axes[0, 1].set(
+        title="Measured response distributions",
+        xlabel="Strength (kPa)",
+    )
+    axes[0, 1].legend(frameon=False)
+
+    axes[1, 0].hist(
+        100 * np.abs(child - X).max(axis=1),
+        bins=18,
+        color=colors[1],
+    )
+    axes[1, 0].set(
+        title="Synthetic composition perturbation",
+        xlabel="Maximum component change (molar percentage points)",
+    )
+
+    # PCA is descriptive only and is not supplied to the regressors.
+    pca = PCA(n_components=2).fit(X)
+    real_pca = pca.transform(X)
+    child_pca = pca.transform(child)
+
+    axes[1, 1].scatter(
+        real_pca[:, 0],
+        real_pca[:, 1],
+        s=20,
+        alpha=0.55,
+        label="Real",
+    )
+    axes[1, 1].scatter(
+        child_pca[:, 0],
+        child_pca[:, 1],
+        s=16,
+        alpha=0.4,
+        label="Synthetic",
+    )
+    axes[1, 1].set(
+        title="Descriptive PCA fitted on real training inputs",
+        xlabel="PC1",
+        ylabel="PC2",
+    )
+    axes[1, 1].legend(frameon=False)
+
+    save(fig, "05_data_and_augmentation_audit")
+
+    figure_list = [
+        (
+            "01_actual_predicted_test",
+            "Actual versus predicted holdout strength",
+        ),
+        (
+            "02_performance_comparison",
+            "Original and augmented prediction error",
+        ),
+        (
+            "03_paired_fold_changes",
+            "Paired validation-fold changes",
+        ),
+        (
+            "04_noise_and_duplication_controls",
+            "Noise and duplication controls",
+        ),
+        (
+            "05_data_and_augmentation_audit",
+            "Data and augmentation audit",
+        ),
+    ]
+
+    # --------------------------------------------------------
+    # 6. Additional retrospective diagnostics
+    # --------------------------------------------------------
+
+    if (OUT / "repeated_metrics.csv").exists():
+        repeated = pd.read_csv(OUT / "repeated_metrics.csv")
+        group = pd.read_csv(OUT / "group_metrics.csv")
+
+        bootstrap = pd.read_csv(
+            OUT / "conditional_bootstrap.csv"
+        ).set_index("model")
+
+        fig, axes = plt.subplots(
+            2, 2,
+            figsize=(12, 8),
+            layout="constrained",
+        )
+
+        ax = axes[0, 0]
+
+        for i, name in enumerate(NAMES):
+            d = repeated[repeated.model == name].pivot(
+                index="repeat_seed",
+                columns="scenario",
+                values="RMSE",
+            )
+
+            delta = d[MAIN[1]] - d[MAIN[0]]
+
+            ax.scatter(
+                i + np.linspace(-0.15, 0.15, 5),
+                delta,
+            )
+            ax.plot(
+                [i - 0.25, i + 0.25],
+                [delta.mean()] * 2,
+                color="black",
+            )
+
+        ax.axhline(0, color="#555555", ls="--")
+        ax.set(
+            xticks=x,
+            xticklabels=short,
+            ylabel="Paired ΔRMSE (kPa)",
+            title="Five repeats on the same training data",
+        )
+
+        train_distance = 0.5 * cdist(X, X, metric="cityblock")
+        np.fill_diagonal(train_distance, np.inf)
+
+        nearest = (
+            0.5
+            * cdist(hold[FEATURES], X, metric="cityblock")
+            .min(axis=1)
+        )
+
+        ax = axes[0, 1]
+
+        for distances, label in [
+            (train_distance.min(axis=1), "Train leave-one-out"),
+            (nearest, "Test to training"),
+        ]:
+            distances = np.sort(distances)
+            ax.step(
+                distances,
+                np.arange(1, len(distances) + 1) / len(distances),
+                where="post",
+                label=label,
+            )
+
+        ax.set(
+            xlabel="Nearest total-variation distance",
+            ylabel="Cumulative proportion",
+            title="Composition proximity",
+        )
+        ax.legend(frameon=False)
+
+        ax = axes[1, 0]
+
+        comparisons = [
+            (cv, MAIN[0], "Random O"),
+            (cv, MAIN[1], "Random A"),
+            (group, MAIN[0], "Group O"),
+            (group, MAIN[1], "Group A"),
+        ]
+
+        for j, (frame, scenario, label) in enumerate(comparisons):
+            values = [
+                frame[
+                    (frame.model == name)
+                    & (frame.scenario == scenario)
+                ].iloc[0].RMSE
+                for name in NAMES
+            ]
+
+            ax.bar(
+                x + (j - 1.5) * 0.18,
+                values,
+                0.18,
+                label=label,
+            )
+
+        ax.set(
+            xticks=x,
+            xticklabels=short,
+            ylabel="Pooled OOF RMSE (kPa)",
+            title="Random and acquisition-proxy evaluation",
+        )
+        ax.legend(frameon=False, ncol=2)
+
+        ax = axes[1, 1]
+
+        for i, name in enumerate(NAMES):
+            row = bootstrap.loc[name]
+            delta = row.delta_RMSE
+
+            ax.errorbar(
+                delta,
+                i,
+                xerr=[
+                    [delta - row.conditional_CI_lower],
+                    [row.conditional_CI_upper - delta],
+                ],
+                fmt="o",
+                capsize=4,
+            )
+
+        ax.axvline(0, color="#555555", ls="--")
+        ax.set(
+            yticks=x,
+            yticklabels=short,
+            xlabel="Test ΔRMSE (kPa)",
+            title="Conditional paired-bootstrap 95% intervals",
+        )
+        ax.invert_yaxis()
+
+        save(fig, "06_additional_diagnostics")
+
+        figure_list.append((
+            "06_additional_diagnostics",
+            "Additional retrospective diagnostics",
+        ))
+
+    # --------------------------------------------------------
+    # HTML report
+    # --------------------------------------------------------
+
+    selection = json.loads(
+        (ROOT / "results/selection_before_test.json").read_text()
+    )
+
+    selected_text = html.escape(
+        selection["model"] + " / " + selection["scenario"]
+    )
+
+    body = [
+        '<!doctype html><html lang="en"><meta charset="utf-8">',
+        "<title>Hydrogel augmentation analysis</title>",
+        (
+            "<style>"
+            "body{font:16px Arial;max-width:1100px;"
+            "margin:40px auto;line-height:1.5}"
+            "img{max-width:100%}"
+            "table{border-collapse:collapse}"
+            "td,th{padding:6px;border:1px solid #ddd}"
+            "</style>"
+        ),
+        "<h1>Hydrogel adhesion prediction</h1>",
+        (
+            "<p>341 real formulations; fixed 272/69 train/test split; "
+            "seed 2026. Nested five-fold validation uses real validation "
+            "rows and fitting-only augmentation.</p>"
+        ),
+        (
+            "<p>Pipeline selected before test evaluation: "
+            + selected_text
+            + ".</p>"
+        ),
+        "<h2>Holdout metrics</h2>",
+        test.to_html(
+            index=False,
+            float_format=lambda value: f"{value:.4f}",
+        ),
+        "<h2>Pooled training-validation metrics</h2>",
+        cv[cv.scenario.isin(MAIN)].to_html(
+            index=False,
+            float_format=lambda value: f"{value:.4f}",
+        ),
+        (
+            "<p>Synthetic responses are inherited labels, not additional "
+            "measurements. The perturbation scale is a modeling choice, "
+            "not measured instrument error. All results use one published "
+            "dataset and the glass-adhesion endpoint. Repeated validations "
+            "reuse the same training observations; acquisition groups "
+            "are snapshot proxies; bootstrap intervals are conditional "
+            "and omit refitting.</p>"
+        ),
+    ]
+
+    for name, caption in figure_list:
+        escaped_caption = html.escape(caption)
+        body.append(
+            f"<h2>{escaped_caption}</h2>"
+            f'<img src="figures/{name}.png" '
+            f'alt="{escaped_caption}">'
+        )
+
+    (ROOT / "report.html").write_text(
+        "\n".join(body) + "</html>",
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# Entry point
+# ============================================================
+
+def main():
+    global ROOT, OUT
+
+    parser = argparse.ArgumentParser(description=__doc__)
+
+    parser.add_argument(
+        "--output",
+        default="hydrogel_outputs",
+    )
+    parser.add_argument(
+        "--skip-extra",
+        action="store_true",
+        help="Skip repeated/group/bootstrap diagnostics.",
+    )
+    parser.add_argument(
+        "--plots-only",
+        action="store_true",
+        help="Regenerate figures from completed output tables.",
+    )
+
+    args = parser.parse_args()
+
+    ROOT = Path(args.output).expanduser().resolve()
+    OUT = ROOT / "results" / "review_diagnostics"
+
+    for folder in ["data", "results", "models", "figures"]:
+        (ROOT / folder).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    if not args.plots_only:
+        if args.skip_extra and OUT.exists():
+            raise RuntimeError(
+                "Use a fresh --output directory with --skip-extra "
+                "to avoid mixing previous diagnostics with a new run."
+            )
+
+        prepare_data()
+        run_study()
+
+        if not args.skip_extra:
+            run_additional()
+
+    make_figures()
+
+    print("Outputs:", ROOT, flush=True)
+    print("Open:", ROOT / "report.html", flush=True)
+
+
+if __name__ == "__main__":
+    # Keep the custom estimator importable when loading saved models.
+    sys.modules["hydrogel_study"] = sys.modules[__name__]
+    AugmentedRegressor.__module__ = "hydrogel_study"
+
+    main()
